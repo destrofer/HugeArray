@@ -1,7 +1,7 @@
 <?php
 /*
  * Copyright 2016 Viacheslav Soroka
- * Version: 1.0.0
+ * Version: 1.0.1
  * 
  * This file is part of HugeArray project <https://github.com/destrofer/HugeArray>.
  * 
@@ -26,9 +26,11 @@
  * or the array WILL get messed up.
  */
 class HugeArray implements ArrayAccess {
-	private $fileName = null;
-	private $file = null;
-	private $fileEnd = 0;
+	protected $fileName = null;
+	protected $file = null;
+	protected $fileEnd = 0;
+	protected $currentNode = 0;
+	protected $nodePath = [];
 
 	/**
 	 * HugeArray constructor.
@@ -49,6 +51,7 @@ class HugeArray implements ArrayAccess {
 			fwrite($this->file, "\0\0\0\0\0\0\0\0\0\0\0\0");
 			$this->fileEnd = 12;
 		}
+		fseek($this->file, 0, SEEK_SET);
 	}
 
 	public function __destruct() {
@@ -67,7 +70,7 @@ class HugeArray implements ArrayAccess {
 	 * @return bool TRUE if enumeration ends successfully or FALSE if enumeration if stopped by $callback returning FALSE.
 	 * @throws Exception In case of an invalid key.
 	 */
-	static function EnumerateBits($key, $callback) {
+	public static function EnumerateBits($key, $callback) {
 		if( $key === null || $key === '' )
 			return true;
 
@@ -99,7 +102,7 @@ class HugeArray implements ArrayAccess {
 	 * @return int|null Will return either an address of an allocated block of data, if it exists, 0 if all key nodes of the offset exist, but no data is allocated and NULL if some of key nodes are missing (only if $create=FALSE).
 	 * @throws Exception In case of an invalid key.
 	 */
-	private function seekToOffset($offset, $create) {
+	protected function seekToOffset($offset, $create) {
 		$referencePointer = 0;
 		$pointer = 0;
 
@@ -126,8 +129,9 @@ class HugeArray implements ArrayAccess {
 			}
 
 			return true;
-		}) )
+		}) ) {
 			return null;
+		}
 
 		// echo "finished at {$pointer}\n";
 
@@ -142,14 +146,96 @@ class HugeArray implements ArrayAccess {
 	}
 
 	/**
+	 * Resets file pointer to the root node of the tree.
+	 *
+	 * @return bool Always return TRUE.
+	 */
+	public function seekReset() {
+		$this->currentNode = 0;
+		// echo "resetting to root node at {$this->currentNode}\n";
+		$this->nodePath = [];
+		return true;
+	}
+
+	/**
+	 * Changes file pointer to the next TRUE or FALSE node of the current node depending on provided bit value.
+	 *
+	 * @param bool $bit TRUE to seek to the TRUE node and FALSE to seek to the FALSE node.
+	 * @return bool TRUE if seeking was successful or FALSE if node for provided bit does not exist.
+	 */
+	public function seekToNextNode($bit) {
+		// echo "trying to seek to next {$bit} node\n";
+		fseek($this->file, $this->currentNode + ($bit ? 8 : 4), SEEK_SET);
+		$pointer = unpack('V', fread($this->file, 4));
+		if( !$pointer[1] ) {
+			// echo " no such node\n";
+			return false;
+		}
+		$this->nodePath[] = $this->currentNode;
+		$this->currentNode = $pointer[1];
+		// echo " node found at {$this->currentNode}\n";
+		return true;
+	}
+
+	public function seekBack() {
+		if( empty($this->nodePath) )
+			return false;
+		$this->currentNode = array_pop($this->nodePath);
+		// echo "traversing back to parent node at {$this->currentNode}\n";
+		return true;
+	}
+
+	/**
+	 * Returns pointer stored in current node to the allocated data block.
+	 *
+	 * @return int 0 if current node has no data block. File offset of the allocated data block otherwise.
+	 */
+	public function getCurrentNodeDataPointer() {
+		fseek($this->file, $this->currentNode, SEEK_SET);
+		$pointer = unpack('V', fread($this->file, 4));
+		// echo "getting current node data pointer from {$this->currentNode} => {$pointer[1]}\n";
+		return $pointer[1];
+	}
+
+	/**
+	 * Reads data block from specified file offset.
+	 *
+	 * No validation is performed so be sure to provide a valid file offset.
+	 *
+	 * @param int $pointer Offset in the file.
+	 * @return mixed|null NULL if offset evaluates to FALSE. Otherwise returns data stored in the specified block.
+	 */
+	public function getDataFromPointer($pointer) {
+		if( !$pointer )
+			return null;
+		// echo "getting data from block at {$pointer}\n";
+		fseek($this->file, $pointer + 4, SEEK_SET); // we need used byte count, not allocated, so we add 4 to offset
+		$size = unpack('V', fread($this->file, 4));
+		$size = $size[1];
+		// echo "reading block of size {$size} from {$pointer}\n";
+		$data = unserialize(fread($this->file, $size));
+		return $data;
+	}
+
+	/**
+	 * Reads data block stored at offset set in the current node.
+	 *
+	 * @return mixed|null NULL if node seeking is invalid or if data offset in the node is 0. Otherwise returns data stored in the allocated block.
+	 */
+	public function getCurrentNodeData() {
+		return $this->getDataFromPointer($this->getCurrentNodeDataPointer());
+	}
+
+	/**
 	 * Checks if array key exists and it is not NULL.
 	 *
 	 * @param string|int|bool|null $offset The key of the array.
 	 * @return bool TRUE if element exists and not NULL. FALSE otherwise.
 	 * @throws Exception In case of an invalid key.
 	 */
-	function offsetExists($offset) {
-		return !!$this->seekToOffset($offset, false);
+	public function offsetExists($offset) {
+		$result = !!$this->seekToOffset($offset, false);
+		return $result;
 	}
 
 	/**
@@ -161,15 +247,9 @@ class HugeArray implements ArrayAccess {
 	 * @return mixed|null Data stored in the array or NULL if the key does not exist.
 	 * @throws Exception In case of an invalid key.
 	 */
-	function offsetGet($offset) {
+	public function offsetGet($offset) {
 		$pointer = $this->seekToOffset($offset, false);
-		if( !$pointer )
-			return null;
-		fseek($this->file, $pointer + 4, SEEK_SET); // we need used byte count, not allocated, so we add 4 to offset
-		$size = unpack('V', fread($this->file, 4));
-		$size = $size[1];
-		// echo "reading block of size {$size} from {$pointer}\n";
-		return unserialize(fread($this->file, $size));
+		return $this->getDataFromPointer($pointer);
 	}
 
 	/**
@@ -179,7 +259,7 @@ class HugeArray implements ArrayAccess {
 	 * @param mixed|null $value Data to store.
 	 * @throws Exception In case of an invalid key.
 	 */
-	function offsetSet($offset, $value) {
+	public function offsetSet($offset, $value) {
 		$pointer = $this->seekToOffset($offset, $value !== null);
 		if( $value === null ) {
 			// setting to null is same as removing
@@ -187,7 +267,6 @@ class HugeArray implements ArrayAccess {
 				// echo "removing pointer at " . ftell($this->file) . "\n";
 				fwrite($this->file, pack('V', 0));
 			}
-			else
 			return;
 		}
 
@@ -233,7 +312,16 @@ class HugeArray implements ArrayAccess {
 	 * @param string|int|bool|null $offset The key of the array.
 	 * @throws Exception In case of an invalid key.
 	 */
-	function offsetUnset($offset) {
+	public function offsetUnset($offset) {
 		$this->offsetSet($offset, null);
+	}
+
+	public function clear() {
+		ftruncate($this->file, 0);
+		fseek($this->file, 0, SEEK_SET);
+		fwrite($this->file, "\0\0\0\0\0\0\0\0\0\0\0\0");
+		fseek($this->file, 0, SEEK_SET);
+		$this->fileEnd = 12;
+		$this->seekReset();
 	}
 }
