@@ -1,7 +1,7 @@
 <?php
 /*
  * Copyright 2016 Viacheslav Soroka
- * Version: 2.0.0
+ * Version: 2.1.0
  * 
  * This file is part of HugeArray project <https://github.com/destrofer/HugeArray>.
  * 
@@ -108,7 +108,7 @@ class HugeArray implements ArrayAccess, Countable {
 	 * Enumerates the bits of the given key.
 	 *
 	 * @param string|int|bool|null $key The key to be enumerated.
-	 * @param callable $callback A callable that will receive all bits of the given key one by one in their order. Callable will receive only one parameter: bitValue. Callable must return a boolean value. If it returns FALSE the enumeration ends and this method returns FALSE.
+	 * @param callable $callback (function(bool $bit):bool) A callable that will receive all bits of the given key one by one in their order. Callable will receive only one parameter: bitValue. Callable must return a boolean value. If it returns FALSE the enumeration ends and this method returns FALSE.
 	 * @return bool TRUE if enumeration ends successfully or FALSE if enumeration if stopped by $callback returning FALSE.
 	 * @throws Exception In case of an invalid key.
 	 */
@@ -447,6 +447,118 @@ class HugeArray implements ArrayAccess, Countable {
 
 		if( $valueInfo['type'] == self::VALUE_TYPE_UNSET ) {
 			$this->itemCount++;
+			fseek($this->file, self::FILE_HEADER_COUNTER_OFFSET, SEEK_SET);
+			fwrite($this->file, pack('V', $this->itemCount));
+		}
+
+		fflush($this->file);
+	}
+
+	/**
+	 * Reads a value from the array, calls callback function and updates the value in the array depending on response returned from the callback.
+	 *
+	 * @param string|int|bool|null $offset The key of the array.
+	 * @param callable $callback (function(bool $exists, mixed $value):array) A callable that will receive two parameters: wherther offset exists and a stored value if it exists. Callback must return an indexed array [$exists, $value], where $exists tells if value must exist after update and $value contains the value that must be stored in place of previous one.
+	 * @param bool $create If this parameter is set to FALSE (default) then the callback will not be called if offset does not exist. If set to TRUE then all offset nodes for given offset will be created in the file if the offset doesn't exist. Even if callback returns a response specifying that the value must be removed.
+	 * @throws Exception In case of an invalid key or if the value could not be stored due to file write errors, or callback returns bad response.
+	 */
+	public function update($offset, $callback, $create = false) {
+		$pointer = $this->moveToOffsetNode($offset, $create);
+		if( !$pointer )
+			return;
+
+		$valueInfo = $this->readNodeValueInfo();
+
+		$exists = $valueInfo['type'] != self::VALUE_TYPE_UNSET;
+		$currentValue = $this->getValueFromValueInfo($valueInfo);
+		$response = $callback($exists, $currentValue);
+		if( !is_array($response) || !array_key_exists(0, $response) || !array_key_exists(1, $response) )
+			throw new Exception('Callback must return an indexed array with two elements [exists, value].');
+
+		if( $exists == $response[0] && (!$exists || $currentValue === $response[1]) )
+			return; // value does not change, so we don't have to do anything
+		unset($exists, $currentValue);
+
+		$newValueInfo = $valueInfo;
+
+		if( !$response[0] )
+			$newValueInfo['type'] = self::VALUE_TYPE_UNSET;
+		else if( $response[1] === null )
+			$newValueInfo['type'] = self::VALUE_TYPE_NULL;
+		else if( $response[1] === false )
+			$newValueInfo['type'] = self::VALUE_TYPE_FALSE;
+		else if( $response[1] === true )
+			$newValueInfo['type'] = self::VALUE_TYPE_TRUE;
+		else if( $response[1] === 0 )
+			$newValueInfo['type'] = self::VALUE_TYPE_ZERO;
+		else if( $response[1] === '' )
+			$newValueInfo['type'] = self::VALUE_TYPE_EMPTY_STRING;
+		else if( $response[1] === [] )
+			$newValueInfo['type'] = self::VALUE_TYPE_EMPTY_ARRAY;
+		else {
+			$newValueInfo['type'] = self::VALUE_TYPE_SERIALIZED_DATA;
+
+			$allocatedSize = 0;
+			if( $valueInfo['pointer'] ) {
+				fseek($this->file, $valueInfo['pointer'], SEEK_SET);
+				$allocatedSize = unpack('V', fread($this->file, 4));
+				$allocatedSize = $allocatedSize[1];
+			}
+
+			$serialized = serialize($response[1]);
+			unset($response);
+
+			$serializedSize = strlen($serialized);
+
+			if( $allocatedSize < $serializedSize )
+				$newValueInfo['pointer'] = $this->fileEnd;
+
+			if( $newValueInfo['pointer'] != $valueInfo['pointer'] ) {
+				fseek($this->file, $newValueInfo['pointer'], SEEK_SET);
+				if( 4 != fwrite($this->file, pack('V', $serializedSize)) ) {// store the number of bytes allocated in the block
+					ftruncate($this->file, $this->fileEnd);
+					throw new Exception('Error storing the value.');
+				}
+			}
+			else
+				fseek($this->file, $newValueInfo['pointer'] + 4, SEEK_SET);
+
+			if( 4 != fwrite($this->file, pack('V', $serializedSize)) ) { // store number of bytes used by serialized data
+				ftruncate($this->file, $this->fileEnd);
+				throw new Exception('Error storing the value.');
+			}
+
+			if( $serializedSize != fwrite($this->file, $serialized) ) {
+				ftruncate($this->file, $this->fileEnd);
+				throw new Exception('Error storing the value.');
+			}
+
+			if( $newValueInfo['pointer'] != $valueInfo['pointer'] )
+				$this->fileEnd += $serializedSize + 8;
+		}
+
+		if( $valueInfo['type'] != $newValueInfo['type'] ) {
+			if( $valueInfo['pointer'] != $newValueInfo['pointer'] ) {
+				fseek($this->file, $pointer, SEEK_SET);
+				fwrite($this->file, pack('C' . self::POINTER_TYPE, $newValueInfo['type'], $newValueInfo['pointer']));
+			}
+			else {
+				fseek($this->file, $pointer, SEEK_SET);
+				fwrite($this->file, pack('C', $newValueInfo['type']));
+			}
+		}
+		else if( $valueInfo['pointer'] != $newValueInfo['pointer'] ) {
+			fseek($this->file, $pointer + 1, SEEK_SET);
+			fwrite($this->file, pack(self::POINTER_TYPE, $newValueInfo['pointer']));
+		}
+
+		if( $valueInfo['type'] == self::VALUE_TYPE_UNSET ) {
+			$this->itemCount++;
+			fseek($this->file, self::FILE_HEADER_COUNTER_OFFSET, SEEK_SET);
+			fwrite($this->file, pack('V', $this->itemCount));
+		}
+		else if( $newValueInfo['type'] == self::VALUE_TYPE_UNSET ) {
+			$this->itemCount--;
 			fseek($this->file, self::FILE_HEADER_COUNTER_OFFSET, SEEK_SET);
 			fwrite($this->file, pack('V', $this->itemCount));
 		}
