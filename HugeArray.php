@@ -1,7 +1,7 @@
 <?php
 /*
  * Copyright 2016 Viacheslav Soroka
- * Version: 2.1.0
+ * Version: 2.1.1
  * 
  * This file is part of HugeArray project <https://github.com/destrofer/HugeArray>.
  * 
@@ -459,7 +459,7 @@ class HugeArray implements ArrayAccess, Countable {
 	 *
 	 * @param string|int|bool|null $offset The key of the array.
 	 * @param callable $callback (function(bool $exists, mixed $value):array) A callable that will receive two parameters: wherther offset exists and a stored value if it exists. Callback must return an indexed array [$exists, $value], where $exists tells if value must exist after update and $value contains the value that must be stored in place of previous one.
-	 * @param bool $create If this parameter is set to FALSE (default) then the callback will not be called if offset does not exist. If set to TRUE then all offset nodes for given offset will be created in the file if the offset doesn't exist. Even if callback returns a response specifying that the value must be removed.
+	 * @param bool $create If this parameter is set to FALSE (default) then the callback will not be called when offset does not exist. If set to TRUE then all offset nodes for given offset will be created in the file if the offset doesn't exist. Even if callback returns a response specifying that the value must be removed. Recommended to set this to TRUE only if update callback is known to or might potentially create a value.
 	 * @throws Exception In case of an invalid key or if the value could not be stored due to file write errors, or callback returns bad response.
 	 */
 	public function update($offset, $callback, $create = false) {
@@ -470,6 +470,9 @@ class HugeArray implements ArrayAccess, Countable {
 		$valueInfo = $this->readNodeValueInfo();
 
 		$exists = $valueInfo['type'] != self::VALUE_TYPE_UNSET;
+		if( !$create && !$exists )
+			return;
+
 		$currentValue = $this->getValueFromValueInfo($valueInfo);
 		$response = $callback($exists, $currentValue);
 		if( !is_array($response) || !array_key_exists(0, $response) || !array_key_exists(1, $response) )
