@@ -1,7 +1,7 @@
 <?php
 /*
  * Copyright 2016 Viacheslav Soroka
- * Version: 2.1.1
+ * Version: 2.2.0
  * 
  * This file is part of HugeArray project <https://github.com/destrofer/HugeArray>.
  * 
@@ -22,6 +22,12 @@
 /**
  * PHP class that implements array functionality but uses disk instead of memory to store data.
  *
+ * Use seekReset(), seekToNextNode(), seekBack(), getCurrentNodeValueInfo() and getCurrentNodeValue() methods for manual
+ * traversing through array keys bit by bit.
+ *
+ * Use rewind(), next(), valid(), key() and current() methods for iterating through values. This also allows to use
+ * HugeArray in foreach loops.
+ *
  * WARNING 1: Do not use same file concurrently in two scripts running at the same time
  * or the array WILL get messed up.
  *
@@ -30,7 +36,7 @@
  * WARNING 3: Do not rely on array_key_exists() function since it does not work properly with ArrayAccess objects.
  * Use exists() method of this class instead.
  */
-class HugeArray implements ArrayAccess, Countable {
+class HugeArray implements ArrayAccess, Countable, Iterator {
 	const FILE_VERSION = 1;
 	const FILE_HEADER_SIZE = 12;
 	const FILE_HEADER_COUNTER_OFFSET = 8; // location, where count of array elements is located
@@ -65,6 +71,15 @@ class HugeArray implements ArrayAccess, Countable {
 
 	/** @var int */
 	protected $itemCount = 0;
+
+	/** @var int[] */
+	private $iteratorPointerStack = [];
+
+	/** @var int[] */
+	private $iteratorBitStack = [];
+
+	/** @var int[] */
+	private $iterationValid = false;
 
 	/**
 	 * HugeArray constructor.
@@ -609,7 +624,120 @@ class HugeArray implements ArrayAccess, Countable {
 		$this->seekReset();
 	}
 
+	/**
+	 * Returns number of items in the array.
+	 *
+	 * @return int Number of items.
+	 */
 	public function count() {
 		return $this->itemCount;
+	}
+
+	/**
+	 * Resets the iterator cursor to first node with a value.
+	 */
+	public function rewind() {
+		$this->iterationValid = ($this->itemCount > 0);
+		if( !$this->iterationValid )
+			return;
+		$this->iteratorPointerStack = [];
+		$this->iteratorBitStack = [];
+
+		fseek($this->file, self::FILE_HEADER_SIZE, SEEK_SET);
+		$type = unpack('C', fread($this->file, 1));
+		if( $type[1] == self::VALUE_TYPE_UNSET )
+			$this->next();
+	}
+
+	/**
+	 * Returns value stored in node at current iterator cursor position.
+	 *
+	 * @return mixed|null Sored value or NULL if iterator cursor is invalid.
+	 */
+	public function current() {
+		if( !$this->iterationValid )
+			return null;
+		$currentPointer = empty($this->iteratorPointerStack) ? self::FILE_HEADER_SIZE : end($this->iteratorPointerStack);
+		fseek($this->file, $currentPointer, SEEK_SET);
+		return $this->getValueFromValueInfo($this->readNodeValueInfo());
+	}
+
+	/**
+	 * Returns offset for the node at current iterator cursor position.
+	 *
+	 * @return null|string Offset string or NULL if iterator cursor is invalid.
+	 */
+	public function key() {
+		if( !$this->iterationValid )
+			return null;
+		$offset = '';
+		$code = 0;
+		for($i = 0, $il = count($this->iteratorBitStack); $i < $il; $i++ ) {
+			$bit = $i % 8;
+			$code |= $this->iteratorBitStack[$i] << (7 - $bit);
+			if( $bit == 7 ) {
+				$offset .= chr($code);
+				$code = 0;
+			}
+		}
+		return $offset;
+	}
+
+	/**
+	 * Moves iterator cursor to the next node with a value.
+	 */
+	public function next() {
+		if( !$this->iterationValid )
+			return;
+
+		if( empty($this->iteratorPointerStack) ) {
+			$currentPointer = self::FILE_HEADER_SIZE;
+			$currentBit = 0;
+		}
+		else {
+			$currentPointer = array_pop($this->iteratorPointerStack);
+			$currentBit = array_pop($this->iteratorBitStack);
+		}
+
+		while(true) {
+			fseek($this->file, $currentPointer + 1 + self::POINTER_SIZE * ($currentBit ? 2 : 1), SEEK_SET);
+			$nextPointer = unpack(self::POINTER_TYPE, fread($this->file, self::POINTER_SIZE));
+			$nextPointer = $nextPointer[1];
+
+			if( $nextPointer ) {
+				$this->iteratorPointerStack[] = $currentPointer;
+				$this->iteratorBitStack[] = $currentBit;
+				$currentPointer = $nextPointer;
+				$currentBit = 0;
+
+				fseek($this->file, $currentPointer, SEEK_SET);
+				$type = unpack('C', fread($this->file, 1));
+				if( $type[1] != self::VALUE_TYPE_UNSET ) {
+					$this->iteratorPointerStack[] = $currentPointer;
+					$this->iteratorBitStack[] = $currentBit;
+					return;
+				}
+			}
+			else {
+				while( $currentBit == 1 ) {
+					if( empty($this->iteratorPointerStack) ) {
+						$this->iterationValid = false; // end of array reached
+						return;
+					}
+					$currentPointer = array_pop($this->iteratorPointerStack);
+					$currentBit = array_pop($this->iteratorBitStack);
+				}
+				$currentBit = 1;
+			}
+		};
+	}
+
+	/**
+	 * Tells if current iterator cursor is valid.
+	 *
+	 * @return bool TRUE if current position valid. FALSE otherwise.
+	 */
+	public function valid() {
+		return $this->iterationValid;
 	}
 }
